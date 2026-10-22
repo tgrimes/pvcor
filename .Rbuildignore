@@ -1,0 +1,9 @@
+^.*\.Rproj$
+^\.Rproj\.user$
+^\.git$
+^\.github$
+^\.gitignore$
+^TODO\.md$
+^\.DS_Store$
+^.*\.Rcheck$
+^.*\.tar\.gz$

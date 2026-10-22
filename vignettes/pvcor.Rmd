@@ -1,0 +1,290 @@
+---
+title: "Getting started with pvcor"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting started with pvcor}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", fig.width = 6.5, fig.height = 3.2, dpi = 96)
+library(pvcor)
+## a small helper: estimate, standard error and z for each coefficient of a second-stage fit
+coef_table <- function(f) round(data.frame(estimate = f$coef, se = f$se, z = f$coef / f$se), 3)
+```
+
+## The idea in plain language
+
+Suppose each sample gets its own co-expression network, and you want to know whether the link between
+two genes changes with a phenotype, a group, or a confounder such as cell composition. The usual recipe
+computes, for each sample, a *pseudo-value*: the sample's leave-one-out contribution to the correlation
+(the LIONESS edge). It then regresses those pseudo-values on the covariate, as if each one were a noisy
+measurement of the correlation at that sample's covariate value.
+
+The catch is that a pseudo-value measures how far a sample moves the correlation *from the pooled
+average of everyone*. Anything that moves the genes' means or variances with the covariate (a shift in
+cell composition, a skewed phenotype) changes that distance, and the regression reports it as a change
+in correlation. It estimates a straight-line approximation of the correlation taken around the pooled
+data, not the correlation you wanted.
+
+`pvcor` changes the base point. For each sample it estimates, using the *other* folds of the data
+(cross-fitting), the conditional means and standard deviations of the two genes and their conditional
+correlation given the covariates. It standardizes the sample against its own conditional law and forms
+
+```
+pseudo-outcome = rho_hat + z1 * z2 - (rho_hat / 2) * (z1^2 + z2^2)
+```
+
+where `z1` and `z2` are the standardized residuals and `rho_hat` is the estimated correlation. This
+pseudo-outcome has conditional mean equal to the conditional correlation, up to an error that is a
+product of two estimation errors and therefore small. Regressing it on the covariate, with
+heteroscedasticity-robust standard errors, answers the question that was asked. Adjustment variables
+enter where the nuisances are fitted, so the answer is the correlation *given* those variables.
+
+The rest of this vignette shows the functions on simulated data.
+
+## One pair of genes
+
+### No change in the conditional correlation
+
+Two genes whose means both rise with a skewed covariate `x`. Given `x`, their correlation is 0.3 for
+everyone, so the true slope of correlation on `x` is zero.
+
+```{r pair-sim}
+set.seed(1)
+N  <- 500
+x  <- as.numeric(scale(rgamma(N, shape = 4)))      # a right-skewed covariate
+e1 <- rnorm(N); e2 <- 0.3 * e1 + sqrt(1 - 0.3^2) * rnorm(N)
+y1 <- x + e1
+y2 <- x + e2
+dat <- data.frame(x = x)
+```
+
+The ordinary route regresses the jackknife pseudo-values on `x`:
+
+```{r pair-pooled}
+pv <- pv_pearson(y1, y2)
+round(summary(lm(pv ~ x))$coefficients, 3)
+```
+
+The slope on `x` is strongly nonzero even though nothing about the conditional correlation changes. The
+two genes share a mean trend and `x` is skewed, which is exactly the situation in which the pooled base
+point misleads.
+
+`pvcor()` takes the two features, a data frame of covariates, a working design for the second stage
+(`w_formula`) and a formula for the nuisance regressions (`nuis_formula`, fitted with `mgcv` GAMs by
+default):
+
+```{r pair-fit}
+fit <- pvcor(y1, y2, data = dat,
+             w_formula = ~ x,                 # second stage: regress the pseudo-outcome on x
+             nuis_formula = ~ s(x, k = 8),    # nuisances: smooth functions of x
+             K = 5)                           # cross-fitting folds
+coef_table(fit$strategies$stdcommon$fit$blp)
+```
+
+The slope is near zero, with a standard error that says how precisely. The intercept is the average
+conditional correlation (about 0.3).
+
+```{r pair-plot, fig.alt = "Two scatterplots against x: ordinary jackknife pseudo-values with an upward fitted line, and orthogonal pseudo-outcomes with a flat fitted line."}
+op <- par(mfrow = c(1, 2), mar = c(4, 4, 2, 1))
+phi <- fit$strategies$stdcommon$phi
+plot(x, pv, pch = 16, cex = 0.4, col = "grey55", ylim = c(-4, 5), xlab = "x",
+     ylab = "pseudo-value", main = "Ordinary jackknife")
+abline(lm(pv ~ x), lwd = 2, col = "firebrick")
+plot(x, phi, pch = 16, cex = 0.4, col = "grey55", ylim = c(-4, 5), xlab = "x",
+     ylab = "pseudo-outcome", main = "Orthogonal")
+abline(lm(phi ~ x), lwd = 2, col = "steelblue")
+par(op)
+```
+
+### A real change
+
+Now let the correlation itself depend on `x`: `rho(x) = tanh(0.3 + 0.4 * x)`. Besides the best linear
+projection (`"identity"`), `link = "tanh"` fits the model `rho(x) = tanh(W %*% beta)` directly, which
+keeps the correlation between -1 and 1.
+
+```{r pair-change}
+set.seed(2)
+x   <- rnorm(N)
+rho <- tanh(0.3 + 0.4 * x)
+e1 <- rnorm(N); e2 <- rho * e1 + sqrt(1 - rho^2) * rnorm(N)
+y1 <- 0.8 * x + e1
+y2 <- 0.8 * x + e2
+fit2 <- pvcor(y1, y2, data = data.frame(x = x), w_formula = ~ x, nuis_formula = ~ s(x, k = 8),
+              K = 5, link = c("identity", "tanh"))
+coef_table(fit2$strategies$stdcommon$fit$blp)
+coef_table(fit2$strategies$stdcommon$fit$tanh)
+```
+
+The first table is the best linear projection of the correlation on `x`: the slope is clearly positive.
+The second is the tanh-scale fit, whose coefficients should be close to the true 0.3 and 0.4. (A tanh fit
+is best behaved when `x` has no extreme tail; with a very skewed `x` the few largest values can make the
+fit unstable, so check the slope against the linear projection.) The returned object holds, for each nuisance strategy, the pseudo-outcomes (`phi`), the standardized residuals (`z1`,
+`z2`), the initial correlation (`rho`) and the second-stage fits under `fit`.
+
+## Adjusting for a confounder
+
+The main use is to ask about a covariate of interest while holding a confounder fixed. Here `x` is the
+covariate of interest and `v` is a confounder (think of a cell-composition score). Both genes load on
+`v`, and the spread of `v` grows with `x`. Given both `x` and `v`, the correlation of the two genes is
+0.3 for everyone, so there is again nothing to find.
+
+```{r adjust-sim}
+set.seed(11)
+N <- 600
+x <- rnorm(N)
+v <- 0.5 * x + exp(0.5 * x) * 0.8 * rnorm(N)
+e1 <- rnorm(N); e2 <- 0.3 * e1 + sqrt(1 - 0.3^2) * rnorm(N)
+y1 <- v + e1
+y2 <- v + e2
+dat <- data.frame(x = x, v = v)
+```
+
+Adjustment is done through `nuis_formula`: put the confounder in the nuisance regressions, and leave
+`w_formula` as the covariate of interest. With more than one variable in `nuis_formula` the default
+strategy is `"separate"` (each feature's mean is fitted with its own smoother).
+
+```{r adjust-fit}
+adjusted <- pvcor(y1, y2, dat, w_formula = ~ x, strategies = "separate",
+                  nuis_formula = ~ s(x, k = 6) + s(v, k = 6))
+unadjusted <- pvcor(y1, y2, dat, w_formula = ~ x, nuis_formula = ~ s(x, k = 6))
+
+coef_table(adjusted$strategies$separate$fit$blp)     # adjusted for v
+coef_table(unadjusted$strategies$stdcommon$fit$blp)  # x only
+```
+
+Adjusting for `v` gives a slope near zero. Leaving `v` out gives the correlation *given `x` alone*, which
+does change with `x` because the confounder is more variable at larger `x`. That is a real feature of the
+marginal correlation, but it is not a change in the association between the genes, and adjusting is what
+separates the two. A confounder that is measured poorly (a noisy proxy) is only partly removed, so state
+the result as the association given the variables you adjusted for.
+
+## Many features at once
+
+`pvcor_many()` runs all pairs of `p` features. It fits each feature's nuisances once, shares one smoother
+across features, and then does matrix arithmetic for the pairs, so the cost grows like `p` model fits plus
+`p^2 N` operations, not one fit per pair. With `comparators = TRUE` (the default) it also returns the
+pooled jackknife regression and liquid association for each pair.
+
+Eight genes with means that rise with `x`; only genes 1 and 2 have a correlation that changes with `x`.
+
+```{r many-sim}
+set.seed(21)
+N <- 500; p <- 8
+x   <- as.numeric(scale(rgamma(N, shape = 4)))
+rho <- tanh(0.2 + 0.4 * x)
+E <- matrix(rnorm(N * p), N, p)
+E[, 2] <- rho * E[, 1] + sqrt(1 - rho^2) * E[, 2]
+Y <- E + outer(x, runif(p, 0.5, 1))
+colnames(Y) <- paste0("gene", 1:p)
+
+tab <- pvcor_many(Y, data.frame(x = x), w_formula = ~ x, nuis_formula = ~ s(x, k = 8), K = 5)
+tab$z        <- tab$b_x / tab$se_x
+tab$z_pooled <- tab$pooled_b_x / tab$pooled_se_x
+head(tab[order(-abs(tab$z)), c("i", "j", "b_x", "se_x", "z", "z_pooled")], 5)
+```
+
+Each row is a pair (`i`, `j` are column indices of `Y`). `b_x` and `se_x` are the orthogonal slope and
+its standard error; the `pooled_*` columns are the ordinary jackknife regression.
+
+```{r many-count}
+c(orthogonal = sum(abs(tab$z) > 1.96), pooled = sum(abs(tab$z_pooled) > 1.96), pairs = nrow(tab))
+```
+
+The pooled regression flags a large share of the 28 pairs because every gene's mean moves with the
+skewed `x`; the orthogonal slopes flag only the pair that truly changes (plus, now and then, a chance
+exceedance).
+
+With many pairs, the nuisance errors of one gene are shared by all of its pairs, which thickens the tail
+of the null distribution of the z-statistics. For a formal screen, calibrate with a residual-permutation
+null; the code below is not run here because it refits the model for each permuted data set.
+
+```{r many-calibrate, eval = FALSE}
+znull <- perm_null(Y, data.frame(x = x), pairs = as.matrix(tab[, c("i", "j")]),
+                   nuis_formula = ~ s(x, k = 8), w_formula = ~ x, B = 5, coef = "x")$orth
+tab$p_perm <- perm_pvalues(tab$z, znull)
+```
+
+`empnull()` is a lighter alternative that fits Efron's empirical null to the center of the z-statistics.
+
+## A group label
+
+When the covariate is a group, `pvcor_groups()` estimates the means, standard deviations and
+correlations within each group on the training folds and forms the pseudo-outcomes from them. The
+second stage is a regression on the group indicator, so the slope is the difference in conditional
+correlation between groups. With `K = 1` the nuisances are fitted in sample and the group averages of the
+pseudo-outcomes are exactly the group sample correlations, which reproduces the group-standardized
+LIONESS arm.
+
+```{r groups}
+set.seed(31)
+N <- 500; p <- 5
+group <- factor(rep(c("control", "case"), c(350, 150)), levels = c("control", "case"))
+r <- ifelse(group == "case", 0.6, 0.2)                       # genes 1 and 2 differ between groups
+E <- matrix(rnorm(N * p), N, p)
+E[, 2] <- r * E[, 1] + sqrt(1 - r^2) * E[, 2]
+Y <- E + (group == "case") * matrix(runif(p, 0.5, 1.5), N, p, byrow = TRUE)  # case-control mean shift
+
+res <- pvcor_groups(Y, group)
+tb <- res$table
+tb$z <- tb$b_groupcase / tb$se_groupcase
+head(tb[order(-abs(tb$z)), c("i", "j", "b_groupcase", "se_groupcase", "z")], 3)
+```
+
+`b_groupcase` is the case-minus-control difference in correlation. Note that the mean shift between
+groups, which would corrupt pooled jackknife scores, does not matter here.
+
+## Partial correlation
+
+`pvcor_pcor()` carries the same construction over to the conditional partial correlation of a small set
+of features. Each pair's pseudo-outcome is built from the whole estimated correlation matrix, so the
+set of features you pass in defines what is held fixed. It needs more samples than features, and it is
+meant for pathways or gene sets of modest size.
+
+Four genes; the partial correlation of genes 1 and 2 (given 3 and 4) changes with `x`.
+
+```{r pcor}
+set.seed(41)
+N <- 500; p <- 4
+x   <- as.numeric(scale(rgamma(N, shape = 4)))
+rho <- tanh(0.2 + 0.4 * x)
+E <- matrix(rnorm(N * p), N, p)
+E[, 2] <- rho * E[, 1] + sqrt(1 - rho^2) * E[, 2]
+E[, 4] <- 0.4 * E[, 3] + sqrt(1 - 0.4^2) * E[, 4]
+Y <- E + outer(x, c(0.8, 0.5, 0.2, 0.6))
+
+pc <- pvcor_pcor(Y, data.frame(x = x), w_formula = ~ x, nuis_formula = ~ s(x, k = 6), K = 5)
+pc$z <- pc$b_x / pc$se_x
+round(pc[, c("i", "j", "b_x", "se_x", "z")], 3)
+```
+
+The first row (genes 1 and 2) shows the change; the other pairs have slopes near zero.
+`pv_pcor()` gives the ordinary jackknife pseudo-values of the partial correlation for comparison.
+
+## Choices you will make
+
+| Argument | What it controls | Guidance |
+|---|---|---|
+| `nuis_formula` | Which variables the means, scales and correlation are allowed to depend on | Include every variable you want held fixed. One covariate: `~ s(x, k = 10)`. |
+| `w_formula` | The working design of the second stage | The covariate(s) of interest, for example `~ x` or `~ group`. |
+| `strategies` / `strategy` | How the two genes' mean smoothers are chosen | `"stdcommon"` (default for one covariate) shares one smoother on the standardized scale; `"separate"` is the default with several variables. |
+| `learner` | Model class for the nuisances | `"gam"` (default), `"lm"` or `"rf"` (random forest, with out-of-bag residuals). |
+| `K` | Cross-fitting folds | 5 is a good default; `K = 1` fits in sample and is for checking, not inference. |
+| `link` | Second stage | `"identity"` (best linear projection) and/or `"tanh"`. |
+| `se` | Standard errors | `"HC3"` (default) or `"HC0"`; `wild_boot_test()` gives a bootstrap test. |
+
+## Cautions
+
+* A slope that is not significant is not evidence of no difference. To claim that the association is
+  unchanged, report the interval for the slope and what it excludes; a wide interval means the data
+  cannot say.
+* The result is the association *given the variables in `nuis_formula`*. Anything not adjusted for, or
+  adjusted for with a noisy proxy, can remain as confounding.
+* With many pairs, calibrate the tails (`perm_null()`, `perm_pvalues()`), and expect the standard error
+  to be larger than that of the unadjusted analysis when the covariate of interest is correlated with
+  the adjustment variables.
+
+See `NEWS.md` for the list of functions and changes. The theory behind the estimator is in the
+accompanying manuscript (in preparation).

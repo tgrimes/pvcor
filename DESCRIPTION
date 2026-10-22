@@ -1,0 +1,19 @@
+Package: pvcor
+Type: Package
+Title: Orthogonal Pseudo-Outcome Regression for Conditional Correlation
+Version: 0.1.0
+Authors@R: person("Tyler", "Grimes", role = c("aut", "cre"), email = "tyler.grimes@unf.edu")
+Description: Cross-fitted, Neyman-orthogonal pseudo-outcomes for the conditional
+    correlation of two features given covariates (and for the conditional partial
+    correlation of a small set of features), with best-linear-projection and
+    tanh-link second stages and heteroscedasticity-consistent inference. Also
+    jackknife (LIONESS-type) pseudo-values for Pearson and partial correlation and
+    the comparators used in the accompanying paper.
+License: MIT + file LICENSE
+URL: https://github.com/tgrimes/pvcor
+BugReports: https://github.com/tgrimes/pvcor/issues
+Encoding: UTF-8
+Imports: mgcv, stats, splines
+Suggests: knitr, limma, ranger, rmarkdown, testthat (>= 3.0.0)
+VignetteBuilder: knitr
+Config/testthat/edition: 3
